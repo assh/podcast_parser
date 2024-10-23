@@ -1,5 +1,4 @@
 # Import necessary libraries
-import feedparser
 import requests
 import os
 import json
@@ -9,16 +8,19 @@ from mutagen.mp3 import MP3
 from PIL import Image
 from io import BytesIO
 import mutagen.id3
+from bs4 import BeautifulSoup
 
 # Function to download podcast episodes from an RSS feed
 def download_podcast(rss_url, download_folder, history_file):
-    # Parse the RSS feed
-    feed = feedparser.parse(rss_url)
-
-    # Check if feed is valid
-    if 'entries' not in feed:
-        print("Invalid RSS feed. Please check the URL.")
+    # Fetch the RSS feed
+    response = requests.get(rss_url)
+    if response.status_code != 200:
+        print("Failed to fetch RSS feed. Please check the URL.")
         return
+
+    # Parse the RSS feed using BeautifulSoup
+    soup = BeautifulSoup(response.content, 'lxml-xml')
+    items = soup.find_all('item')
 
     # Create the download folder if it doesn't exist
     if not os.path.exists(download_folder):
@@ -32,11 +34,12 @@ def download_podcast(rss_url, download_folder, history_file):
         downloaded_episodes = []
 
     # Iterate over the episodes and download them
-    for entry in feed.entries:
-        # Get episode title, GUID, and URL
-        title = entry.title.replace('/', '-')  # Replace slashes to avoid issues with filenames
-        guid = entry.get('guid', entry.title)  # Use GUID if available, otherwise use title
-        media_url = entry.enclosures[0].href if 'enclosures' in entry and len(entry.enclosures) > 0 else None
+    for item in items:
+        # Get episode title, GUID, and media URL
+        title = item.find('title').text.replace('/', '-')  # Replace slashes to avoid issues with filenames
+        guid = item.find('guid').text if item.find('guid') else title  # Use GUID if available, otherwise use title
+        enclosure = item.find('enclosure')
+        media_url = enclosure['url'] if enclosure else None
 
         if media_url and guid not in downloaded_episodes:
             print(f"Downloading: {title}")
@@ -55,15 +58,17 @@ def download_podcast(rss_url, download_folder, history_file):
                 audio = mutagen.File(file_path, easy=True)
                 audio.add_tags()
 
-            audio['title'] = entry.title
-            audio['artist'] = entry.get('author', 'Unknown Artist')
-            audio['album'] = feed.feed.get('title', 'Podcast')
-            audio['date'] = entry.get('published', 'Unknown Date')
-            audio['website'] = entry.get('link', '')
+            audio['title'] = title
+            audio['artist'] = item.find('author').text if item.find('author') else 'Unknown Artist'
+            audio['album'] = soup.find('title').text if soup.find('title') else 'Podcast'
+            audio['date'] = item.find('pubDate').text if item.find('pubDate') else 'Unknown Date'
+            audio['website'] = item.find('link').text if item.find('link') else ''
             audio.save()
 
             # Add album art to the downloaded file using episode-specific image
-            image_url = entry.get('itunes_image', {}).get('href') or entry.get('media_thumbnail', [{}])[0].get('url')
+            image_tag = item.find('itunes:image')
+            image_url = image_tag['href'] if image_tag else None
+
             if image_url:
                 image_response = requests.get(image_url)
                 if image_response.status_code == 200:
