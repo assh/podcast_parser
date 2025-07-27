@@ -5,9 +5,10 @@ import json
 import mutagen
 from mutagen.easyid3 import EasyID3
 from mutagen.mp3 import MP3
-from PIL import Image
+from PIL import Image 
 from io import BytesIO
 import mutagen.id3
+from mutagen.id3 import ID3, COMM
 from bs4 import BeautifulSoup
 
 # Function to download podcast episodes from an RSS feed
@@ -85,6 +86,11 @@ def download_podcast(rss_url, download_folder, history_file):
                         )
                     )
                     audio.save()
+
+            description = item.find('description').text if item.find('description') else ''
+            id3 = ID3(file_path)
+            id3.add(COMM(encoding=3, text=description))
+            id3.save()
 
             print(f"Downloaded and tagged: {title}\n")
             downloaded_episodes.append(guid)
