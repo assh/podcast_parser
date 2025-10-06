@@ -1,110 +1,318 @@
 # Import necessary libraries
-import requests
 import os
 import json
-import mutagen
-from mutagen.easyid3 import EasyID3
-from mutagen.mp3 import MP3
-from PIL import Image 
+import re
+import sys
 from io import BytesIO
-import mutagen.id3
-from mutagen.id3 import ID3, COMM
+from datetime import datetime
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 from bs4 import BeautifulSoup
 
-# Function to download podcast episodes from an RSS feed
+import mutagen
+import mutagen.id3
+from mutagen.easyid3 import EasyID3
+from mutagen.mp3 import MP3
+from mutagen.id3 import ID3, COMM, APIC, WOAS
+from PIL import Image
+
+
+# ----------------------------
+# Utilities
+# ----------------------------
+
+def sanitize_filename(name: str, max_len: int = 140) -> str:
+    """Return a filesystem-safe filename derived from a title.
+    Removes/normalizes risky characters and trims length to avoid OS limits.
+    """
+    # Normalize whitespace
+    name = re.sub(r"\s+", " ", name).strip()
+    # Replace slashes and other reserved characters
+    name = re.sub(r"[\\/\:*?\"<>|]", "-", name)
+    # Remove control chars
+    name = re.sub(r"[\x00-\x1f\x7f]", "", name)
+    # Trim length preserving extension to be added later
+    if len(name) > max_len:
+        name = name[:max_len].rstrip()
+    # Avoid empty
+    return name or "episode"
+
+
+def ensure_dir(path: str) -> None:
+    if not os.path.exists(path):
+        os.makedirs(path, exist_ok=True)
+
+
+def load_history(history_file: str) -> dict:
+    if os.path.exists(history_file):
+        try:
+            with open(history_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # Support legacy list format -> convert to dict
+            if isinstance(data, list):
+                return {k: None for k in data}
+            return dict(data)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_history(history_file: str, history: dict) -> None:
+    with open(history_file, "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
+
+
+def new_session() -> requests.Session:
+    """Create a requests session with a retry strategy and user-agent."""
+    s = requests.Session()
+    retries = Retry(
+        total=5,
+        connect=3,
+        read=3,
+        backoff_factor=0.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET", "HEAD"),
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    s.headers.update({
+        "User-Agent": "podcast-parser/1.0 (+https://example.local)"
+    })
+    return s
+
+
+# ----------------------------
+# Core logic
+# ----------------------------
+
+def extract_text(tag):
+    return tag.get_text(strip=True) if tag else None
+
+
+def guess_author(item, soup):
+    # Prefer iTunes author if present
+    itunes_author = item.find("itunes:author") or soup.find("itunes:author")
+    if itunes_author and itunes_author.text.strip():
+        return itunes_author.text.strip()
+    # Fallback to <author>
+    author = item.find("author")
+    if author and author.text.strip():
+        return author.text.strip()
+    # Channel title as last resort
+    channel_title = soup.find("title")
+    return channel_title.text.strip() if channel_title else "Unknown Artist"
+
+
+def episode_image_url(item, soup):
+    # Episode image first
+    img = item.find("itunes:image")
+    if img and img.get("href"):
+        return img["href"].strip()
+    # Channel image fallback
+    ch_img = soup.find("itunes:image") or soup.find("image")
+    if ch_img and ch_img.get("href"):
+        return ch_img["href"].strip()
+    url_tag = soup.find("image")
+    if url_tag and url_tag.find("url"):
+        return url_tag.find("url").text.strip()
+    return None
+
+
+def add_id3_tags(mp3_path: str, *, title: str, artist: str, album: str,
+                 date_text: str | None, link_url: str | None,
+                 description: str | None, image_bytes: bytes | None) -> None:
+    # Basic tags via EasyID3 (auto-creates header if missing)
+    try:
+        audio = EasyID3(mp3_path)
+    except mutagen.id3.ID3NoHeaderError:
+        audio = mutagen.File(mp3_path, easy=True)
+        audio.add_tags()
+    audio["title"] = title
+    audio["artist"] = artist
+    audio["album"] = album
+    if date_text:
+        # Attempt to format date to YYYY-MM-DD if possible
+        try:
+            dt = datetime.strptime(date_text.strip(), "%a, %d %b %Y %H:%M:%S %z")
+            audio["date"] = dt.strftime("%Y-%m-%d")
+        except Exception:
+            audio["date"] = date_text.strip()
+    audio.save()
+
+    id3 = ID3(mp3_path)
+
+    # Description (COMM)
+    if description:
+        # Remove existing COMM frames to avoid duplicates
+        for frame in list(id3.getall("COMM")):
+            id3.delall("COMM")
+            break
+        id3.add(COMM(encoding=3, lang="eng", desc="desc", text=description))
+
+    # Official source URL frame (WOAS)
+    if link_url:
+        for frame in list(id3.getall("WOAS")):
+            id3.delall("WOAS")
+            break
+        id3.add(WOAS(url=link_url))
+
+    # Cover art (APIC)
+    if image_bytes:
+        try:
+            # Validate image
+            Image.open(BytesIO(image_bytes)).verify()
+            # Remove existing APIC frames
+            id3.delall("APIC")
+            id3.add(APIC(
+                encoding=3,
+                mime="image/jpeg",
+                type=3,  # front cover
+                desc="Cover",
+                data=image_bytes,
+            ))
+        except Exception:
+            # Ignore invalid image data
+            pass
+
+    id3.save(v2_version=3)
+
+
+def download_file(session: requests.Session, url: str, dest_path: str, *,
+                  chunk_size: int = 1024 * 256, timeout: int = 30) -> None:
+    # Write to temp then atomic rename
+    tmp_path = dest_path + ".part"
+    with session.get(url, stream=True, timeout=timeout) as r:
+        r.raise_for_status()
+        with open(tmp_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=chunk_size):
+                if chunk:
+                    f.write(chunk)
+    os.replace(tmp_path, dest_path)
+
+
 def download_podcast(rss_url, download_folder, history_file):
+    session = new_session()
+
     # Fetch the RSS feed
-    response = requests.get(rss_url)
-    if response.status_code != 200:
-        print("Failed to fetch RSS feed. Please check the URL.")
+    try:
+        resp = session.get(rss_url, timeout=30)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"Failed to fetch RSS feed: {e}")
         return
 
-    # Parse the RSS feed using BeautifulSoup
-    soup = BeautifulSoup(response.content, 'lxml-xml')
-    items = soup.find_all('item')
+    # Parse the RSS feed using BeautifulSoup (XML)
+    soup = BeautifulSoup(resp.content, "lxml-xml")
+    items = soup.find_all("item")
 
-    # Create the download folder if it doesn't exist
-    if not os.path.exists(download_folder):
-        os.makedirs(download_folder)
+    ensure_dir(download_folder)
+    history = load_history(history_file)
 
-    # Load download history
-    if os.path.exists(history_file):
-        with open(history_file, 'r') as file:
-            downloaded_episodes = json.load(file)
-    else:
-        downloaded_episodes = []
+    channel_title = extract_text(soup.find("title")) or "Podcast"
 
-    # Iterate over the episodes and download them
     for item in items:
-        # Get episode title, GUID, and media URL
-        title = item.find('title').text.replace('/', '-')  # Replace slashes to avoid issues with filenames
-        guid = item.find('guid').text if item.find('guid') else title  # Use GUID if available, otherwise use title
-        enclosure = item.find('enclosure')
-        media_url = enclosure['url'] if enclosure else None
+        raw_title = extract_text(item.find("title")) or "episode"
+        pub_date = extract_text(item.find("pubDate"))
+        link_tag = extract_text(item.find("link"))
+        guid_tag = extract_text(item.find("guid"))
+        enclosure = item.find("enclosure")
+        media_url = enclosure["url"].strip() if enclosure and enclosure.get("url") else None
+        media_type = enclosure.get("type") if enclosure else None
 
-        if media_url and guid not in downloaded_episodes:
-            print(f"Downloading: {title}")
-            response = requests.get(media_url, stream=True)
+        # Use GUID or fallback to media URL/title as key
+        episode_key = guid_tag or media_url or raw_title
+        if episode_key in history:
+            print(f"Skipping already downloaded: {raw_title}")
+            continue
 
-            # Save the file to the download folder
-            file_path = os.path.join(download_folder, f"{title}.mp3")
-            with open(file_path, 'wb') as file:
-                for chunk in response.iter_content(chunk_size=1024):
-                    file.write(chunk)
+        if not media_url:
+            print(f"No media URL for: {raw_title} — skipping")
+            continue
 
-            # Add metadata to the downloaded file
+        if media_type and not media_type.startswith("audio/"):
+            print(f"Non-audio enclosure for: {raw_title} ({media_type}) — skipping")
+            continue
+
+        # Build destination filename
+        safe_title = sanitize_filename(raw_title)
+        # If titles collide, append date or a counter
+        filename = f"{safe_title}.mp3"
+        dest_path = os.path.join(download_folder, filename)
+        if os.path.exists(dest_path):
+            suffix = None
+            if pub_date:
+                try:
+                    dt = datetime.strptime(pub_date, "%a, %d %b %Y %H:%M:%S %z")
+                    suffix = dt.strftime("%Y-%m-%d")
+                except Exception:
+                    suffix = None
+            filename = f"{safe_title} - {suffix or 'dup'}.mp3"
+            dest_path = os.path.join(download_folder, filename)
+
+        print(f"Downloading: {raw_title}")
+        try:
+            download_file(session, media_url, dest_path)
+        except Exception as e:
+            print(f"Failed to download '{raw_title}': {e}")
+            # Clean up partial
             try:
-                audio = EasyID3(file_path)
-            except mutagen.id3.ID3NoHeaderError:
-                audio = mutagen.File(file_path, easy=True)
-                audio.add_tags()
+                if os.path.exists(dest_path + ".part"):
+                    os.remove(dest_path + ".part")
+            except Exception:
+                pass
+            continue
 
-            audio['title'] = title
-            audio['artist'] = item.find('author').text if item.find('author') else 'Unknown Artist'
-            audio['album'] = soup.find('title').text if soup.find('title') else 'Podcast'
-            audio['date'] = item.find('pubDate').text if item.find('pubDate') else 'Unknown Date'
-            audio['website'] = item.find('link').text if item.find('link') else ''
-            audio.save()
+        # Prepare tags
+        artist = guess_author(item, soup)
+        description = extract_text(item.find("description")) or ""
+        img_url = episode_image_url(item, soup)
+        img_bytes = None
+        if img_url:
+            try:
+                img_resp = session.get(img_url, timeout=20)
+                if img_resp.ok:
+                    img_bytes = img_resp.content
+            except Exception:
+                pass
 
-            # Add album art to the downloaded file using episode-specific image
-            image_tag = item.find('itunes:image')
-            image_url = image_tag['href'] if image_tag else None
+        try:
+            add_id3_tags(
+                dest_path,
+                title=raw_title,
+                artist=artist,
+                album=channel_title,
+                date_text=pub_date,
+                link_url=link_tag,
+                description=description,
+                image_bytes=img_bytes,
+            )
+        except Exception as e:
+            print(f"Warning: failed to tag '{raw_title}': {e}")
 
-            if image_url:
-                image_response = requests.get(image_url)
-                if image_response.status_code == 200:
-                    img_byte_array = BytesIO(image_response.content).getvalue()
+        print(f"Downloaded and tagged: {raw_title}\n")
+        history[episode_key] = filename
+        save_history(history_file, history)
 
-                    audio = MP3(file_path, ID3=mutagen.id3.ID3)
-                    audio.tags.add(
-                        mutagen.id3.APIC(
-                            encoding=3,  # UTF-8
-                            mime='image/jpeg',
-                            type=3,  # Cover (front)
-                            desc='Cover',
-                            data=img_byte_array
-                        )
-                    )
-                    audio.save()
 
-            description = item.find('description').text if item.find('description') else ''
-            id3 = ID3(file_path)
-            id3.add(COMM(encoding=3, text=description))
-            id3.save()
+# ----------------------------
+# CLI entrypoint
+# ----------------------------
+if __name__ == "__main__":
+    import argparse
 
-            print(f"Downloaded and tagged: {title}\n")
-            downloaded_episodes.append(guid)
-        else:
-            print(f"Skipping already downloaded episode: {title}\n")
+    parser = argparse.ArgumentParser(description="Download and tag podcast episodes from an RSS feed.")
+    parser.add_argument("rss_url", nargs="?", default="https://feeds.simplecast.com/TBotaapn", help="Podcast RSS feed URL")
+    parser.add_argument("--out", dest="download_folder", default="podcasts", help="Output folder for downloads")
+    parser.add_argument("--history", dest="history_file", default="download_history.json", help="History JSON file path")
 
-    # Save updated download history
-    with open(history_file, 'w') as file:
-        json.dump(downloaded_episodes, file)
+    args = parser.parse_args()
 
-# Example usage
-rss_feed_url = "https://feeds.simplecast.com/TBotaapn"  # Replace with the RSS feed URL of the podcast
-download_folder = "podcasts"  # Replace with your desired download folder
-history_file = "download_history.json"  # File to keep track of downloaded episodes
-
-# Download podcast episodes
-download_podcast(rss_feed_url, download_folder, history_file)
+    try:
+        download_podcast(args.rss_url, args.download_folder, args.history_file)
+    except KeyboardInterrupt:
+        print("\nInterrupted by user.")
+        sys.exit(1)
