@@ -4,7 +4,7 @@ import json
 import re
 import sys
 from io import BytesIO
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -18,6 +18,9 @@ from mutagen.easyid3 import EasyID3
 from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, COMM, APIC, WOAS
 from PIL import Image
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
 
 
 # ----------------------------
@@ -91,6 +94,15 @@ def new_session() -> requests.Session:
 
 def extract_text(tag):
     return tag.get_text(strip=True) if tag else None
+
+
+def parse_rfc822(dt: str):
+    for fmt in ("%a, %d %b %Y %H:%M:%S %z", "%a, %d %b %Y %H:%M:%S %Z"):
+        try:
+            return datetime.strptime(dt, fmt)
+        except Exception:
+            pass
+    return None
 
 
 def guess_author(item, soup):
@@ -183,14 +195,20 @@ def add_id3_tags(mp3_path: str, *, title: str, artist: str, album: str,
 
 def download_file(session: requests.Session, url: str, dest_path: str, *,
                   chunk_size: int = 1024 * 256, timeout: int = 30) -> None:
-    # Write to temp then atomic rename
+    # Write to temp then atomic rename with a progress bar
     tmp_path = dest_path + ".part"
     with session.get(url, stream=True, timeout=timeout) as r:
         r.raise_for_status()
-        with open(tmp_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=chunk_size):
-                if chunk:
-                    f.write(chunk)
+        total = int(r.headers.get("Content-Length") or 0)
+        pbar = tqdm(total=total, unit="B", unit_scale=True, desc=os.path.basename(dest_path))
+        try:
+            with open(tmp_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=chunk_size):
+                    if chunk:
+                        f.write(chunk)
+                        pbar.update(len(chunk))
+        finally:
+            pbar.close()
     os.replace(tmp_path, dest_path)
 
 
@@ -209,12 +227,43 @@ def download_podcast(rss_url, download_folder, history_file):
     soup = BeautifulSoup(resp.content, "lxml-xml")
     items = soup.find_all("item")
 
+    # Optional filters applied later via CLI args (since/limit) — set placeholders here
+    # Actual values will be passed in via function closure (see process_item usage).
+
     ensure_dir(download_folder)
     history = load_history(history_file)
 
     channel_title = extract_text(soup.find("title")) or "Podcast"
 
+    # Apply --since and --limit filters if provided via outer scope
+    filtered = []
+    if hasattr(download_podcast, "since_dt") and download_podcast.since_dt:
+        since_dt = download_podcast.since_dt
+    else:
+        since_dt = None
+
     for item in items:
+        pub_date = extract_text(item.find("pubDate"))
+        if since_dt and pub_date:
+            dt = parse_rfc822(pub_date)
+            if dt and dt <= since_dt:
+                continue
+        filtered.append(item)
+
+    if hasattr(download_podcast, "limit") and download_podcast.limit:
+        filtered = filtered[: download_podcast.limit]
+
+    items = filtered
+
+    # Per-show subfolder
+    channel_dir_name = sanitize_filename(channel_title, max_len=80)
+    dest_dir = os.path.join(download_folder, channel_dir_name)
+    ensure_dir(dest_dir)
+
+    def process_item(item):
+        # Create a per-thread session to avoid sharing sessions across threads
+        sess = new_session()
+
         raw_title = extract_text(item.find("title")) or "episode"
         pub_date = extract_text(item.find("pubDate"))
         link_tag = extract_text(item.find("link"))
@@ -227,44 +276,47 @@ def download_podcast(rss_url, download_folder, history_file):
         episode_key = guid_tag or media_url or raw_title
         if episode_key in history:
             print(f"Skipping already downloaded: {raw_title}")
-            continue
+            return None
 
         if not media_url:
             print(f"No media URL for: {raw_title} — skipping")
-            continue
+            return None
 
         if media_type and not media_type.startswith("audio/"):
             print(f"Non-audio enclosure for: {raw_title} ({media_type}) — skipping")
-            continue
+            return None
 
-        # Build destination filename
-        safe_title = sanitize_filename(raw_title)
-        # If titles collide, append date or a counter
-        filename = f"{safe_title}.mp3"
-        dest_path = os.path.join(download_folder, filename)
+        # Build destination filename with date and episode number if available
+        date_part = ""
+        if pub_date:
+            dt = parse_rfc822(pub_date)
+            if dt:
+                date_part = dt.strftime("%Y-%m-%d")
+
+        ep_no = extract_text(item.find("itunes:episode")) or ""
+        title_for_name = sanitize_filename(raw_title)
+        pieces = [p for p in [date_part, ep_no, title_for_name] if p]
+        base_name = " - ".join(pieces) if pieces else title_for_name
+        filename = f"{base_name}.mp3"
+        dest_path = os.path.join(dest_dir, filename)
+
+        # Handle collisions
         if os.path.exists(dest_path):
-            suffix = None
-            if pub_date:
-                try:
-                    dt = datetime.strptime(pub_date, "%a, %d %b %Y %H:%M:%S %z")
-                    suffix = dt.strftime("%Y-%m-%d")
-                except Exception:
-                    suffix = None
-            filename = f"{safe_title} - {suffix or 'dup'}.mp3"
-            dest_path = os.path.join(download_folder, filename)
+            suffix = date_part or "dup"
+            filename = f"{title_for_name} - {suffix}.mp3"
+            dest_path = os.path.join(dest_dir, filename)
 
         print(f"Downloading: {raw_title}")
         try:
-            download_file(session, media_url, dest_path)
+            download_file(sess, media_url, dest_path)
         except Exception as e:
             print(f"Failed to download '{raw_title}': {e}")
-            # Clean up partial
             try:
                 if os.path.exists(dest_path + ".part"):
                     os.remove(dest_path + ".part")
             except Exception:
                 pass
-            continue
+            return None
 
         # Prepare tags
         artist = guess_author(item, soup)
@@ -273,7 +325,7 @@ def download_podcast(rss_url, download_folder, history_file):
         img_bytes = None
         if img_url:
             try:
-                img_resp = session.get(img_url, timeout=20)
+                img_resp = sess.get(img_url, timeout=20)
                 if img_resp.ok:
                     img_bytes = img_resp.content
             except Exception:
@@ -294,8 +346,20 @@ def download_podcast(rss_url, download_folder, history_file):
             print(f"Warning: failed to tag '{raw_title}': {e}")
 
         print(f"Downloaded and tagged: {raw_title}\n")
-        history[episode_key] = filename
-        save_history(history_file, history)
+        return (episode_key, os.path.basename(dest_path))
+
+    # Parallel execution
+    workers = getattr(download_podcast, "workers", 1)
+    tasks = []
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        for item in items:
+            tasks.append(ex.submit(process_item, item))
+        for fut in as_completed(tasks):
+            res = fut.result()
+            if res:
+                k, fname = res
+                history[k] = fname
+                save_history(history_file, history)
 
 
 # ----------------------------
@@ -308,8 +372,16 @@ if __name__ == "__main__":
     parser.add_argument("rss_url", nargs="?", default="https://feeds.simplecast.com/TBotaapn", help="Podcast RSS feed URL")
     parser.add_argument("--out", dest="download_folder", default="podcasts", help="Output folder for downloads")
     parser.add_argument("--history", dest="history_file", default="download_history.json", help="History JSON file path")
+    parser.add_argument("--limit", type=int, default=None, help="Max episodes to download")
+    parser.add_argument("--since", type=str, default=None, help="Only episodes after YYYY-MM-DD")
+    parser.add_argument("--workers", type=int, default=4, help="Parallel downloads")
 
     args = parser.parse_args()
+
+    # Thread CLI parameters through the function via attributes
+    download_podcast.limit = args.limit
+    download_podcast.since_dt = datetime.strptime(args.since, "%Y-%m-%d").replace(tzinfo=timezone.utc) if args.since else None
+    download_podcast.workers = max(1, args.workers)
 
     try:
         download_podcast(args.rss_url, args.download_folder, args.history_file)
