@@ -3,6 +3,7 @@ import os
 import json
 import re
 import sys
+import subprocess
 from io import BytesIO
 from datetime import datetime, timezone
 
@@ -212,6 +213,26 @@ def download_file(session: requests.Session, url: str, dest_path: str, *,
     os.replace(tmp_path, dest_path)
 
 
+def media_duration_seconds(path: str) -> float:
+    p = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=nk=1:nw=1",
+            path,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if p.returncode != 0:
+        raise RuntimeError(p.stderr.strip() or "ffprobe failed")
+    return float(p.stdout.strip())
+
+
 def download_podcast(rss_url, download_folder, history_file):
     session = new_session()
 
@@ -232,8 +253,18 @@ def download_podcast(rss_url, download_folder, history_file):
 
     ensure_dir(download_folder)
     history = load_history(history_file)
+    history_keys_at_start = set(history.keys())
 
     channel_title = extract_text(soup.find("title")) or "Podcast"
+    ad_cut_enabled = getattr(download_podcast, "ad_cut", False)
+    ad_clip = getattr(download_podcast, "ad_clip", None)
+    ad_clip_length = None
+    if ad_cut_enabled and ad_clip:
+        try:
+            ad_clip_length = media_duration_seconds(ad_clip)
+        except Exception as e:
+            print(f"Warning: disabling ad-cut, failed to read ad clip '{ad_clip}': {e}")
+            ad_cut_enabled = False
 
     # Apply --since and --limit filters if provided via outer scope
     filtered = []
@@ -274,7 +305,7 @@ def download_podcast(rss_url, download_folder, history_file):
 
         # Use GUID or fallback to media URL/title as key
         episode_key = guid_tag or media_url or raw_title
-        if episode_key in history:
+        if episode_key in history_keys_at_start:
             print(f"Skipping already downloaded: {raw_title}")
             return None
 
@@ -317,6 +348,44 @@ def download_podcast(rss_url, download_folder, history_file):
             except Exception:
                 pass
             return None
+
+        # Run ad-cut only for newly downloaded episodes (i.e., not already in history).
+        if ad_cut_enabled and ad_clip_length is not None and episode_key not in history_keys_at_start:
+            root, ext = os.path.splitext(dest_path)
+            cleaned_path = f"{root}.cleaned{ext or '.mp3'}"
+            cmd = [
+                sys.executable,
+                os.path.join(os.path.dirname(__file__), "ad_detect.py"),
+                dest_path,
+                "--apply",
+                "--summary-only",
+                "--cue",
+                ad_clip,
+                "--cue-is-ad-clip",
+                "--cue-length",
+                str(ad_clip_length),
+                "--verify-threshold",
+                "0.0",
+                "--output",
+                cleaned_path,
+            ]
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True)
+                if proc.returncode != 0:
+                    err = (proc.stderr or "").strip()
+                    print(f"Ad-cut failed for '{raw_title}': {err or 'unknown error'}")
+                    try:
+                        if os.path.exists(cleaned_path):
+                            os.remove(cleaned_path)
+                    except Exception:
+                        pass
+                elif os.path.exists(cleaned_path):
+                    os.replace(cleaned_path, dest_path)
+                    out = (proc.stdout or "").strip()
+                    if out:
+                        print(f"{raw_title}: {out}")
+            except Exception as e:
+                print(f"Ad-cut failed for '{raw_title}': {e}")
 
         # Prepare tags
         artist = guess_author(item, soup)
@@ -375,6 +444,8 @@ if __name__ == "__main__":
     parser.add_argument("--limit", type=int, default=None, help="Max episodes to download")
     parser.add_argument("--since", type=str, default=None, help="Only episodes after YYYY-MM-DD")
     parser.add_argument("--workers", type=int, default=4, help="Parallel downloads")
+    parser.add_argument("--ad-cut", action="store_true", help="Run ad-cut for newly downloaded episodes only.")
+    parser.add_argument("--ad-clip", type=str, default=None, help="Path to ad clip MP3 used for match-and-cut.")
 
     args = parser.parse_args()
 
@@ -382,6 +453,8 @@ if __name__ == "__main__":
     download_podcast.limit = args.limit
     download_podcast.since_dt = datetime.strptime(args.since, "%Y-%m-%d").replace(tzinfo=timezone.utc) if args.since else None
     download_podcast.workers = max(1, args.workers)
+    download_podcast.ad_cut = args.ad_cut
+    download_podcast.ad_clip = os.path.abspath(args.ad_clip) if args.ad_clip else None
 
     try:
         download_podcast(args.rss_url, args.download_folder, args.history_file)

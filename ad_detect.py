@@ -310,7 +310,7 @@ def cue_candidate_windows(
     cue_threshold: float,
     cue_min_peak_gap: float,
     cue_max_pair_gap: float,
-) -> tuple[list[tuple[float, float]], list[float]]:
+) -> tuple[list[tuple[float, float]], list[float], float]:
     episode = load_audio_mono_f32(audio_path, sample_rate)
     cue_audio = load_audio_mono_f32(cue_path, sample_rate)
     cue_start_idx = int(max(0.0, cue_start) * sample_rate)
@@ -325,7 +325,7 @@ def cue_candidate_windows(
     peaks_sec = [p / sample_rate for p in peaks]
     cue_sec = cue_seg.size / sample_rate
     windows = merge_windows(pair_boundaries(peaks_sec, cue_sec, cue_max_pair_gap), gap=0.5)
-    return windows, peaks_sec
+    return windows, peaks_sec, cue_sec
 
 
 def merge_windows(windows: list[tuple[float, float]], gap: float = 3.0) -> list[tuple[float, float]]:
@@ -370,7 +370,7 @@ def apply_cuts(audio_path: str, output_path: str, keep: list[tuple[float, float]
     if not keep:
         raise RuntimeError("No keep windows; refusing to write empty output.")
     filt = ffmpeg_concat_filter(keep)
-    cmd = [
+    cmd_direct = [
         "ffmpeg",
         "-y",
         "-i",
@@ -385,7 +385,49 @@ def apply_cuts(audio_path: str, output_path: str, keep: list[tuple[float, float]
         "2",
         output_path,
     ]
-    run(cmd)
+    try:
+        run(cmd_direct)
+    except Exception:
+        # Fallback for rare libmp3lame/MP3 frame edge cases:
+        # render filtered audio to WAV first, then encode to MP3.
+        tmp_wav = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+                tmp_wav = tf.name
+            run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    audio_path,
+                    "-filter_complex",
+                    filt,
+                    "-map",
+                    "[outa]",
+                    "-c:a",
+                    "pcm_s16le",
+                    tmp_wav,
+                ]
+            )
+            run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    tmp_wav,
+                    "-codec:a",
+                    "libmp3lame",
+                    "-q:a",
+                    "2",
+                    output_path,
+                ]
+            )
+        finally:
+            if tmp_wav and os.path.exists(tmp_wav):
+                try:
+                    os.remove(tmp_wav)
+                except Exception:
+                    pass
     copy_id3_tags(audio_path, output_path)
 
 
@@ -435,6 +477,11 @@ def main() -> int:
     parser.add_argument("--pad-seconds", type=float, default=0.7, help="Padding around detected cuts")
     parser.add_argument("--min-cut-seconds", type=float, default=8.0, help="Drop tiny ad windows")
     parser.add_argument("--cue", default=None, help="Cue audio that plays before and after ad blocks.")
+    parser.add_argument(
+        "--cue-is-ad-clip",
+        action="store_true",
+        help="Treat cue as the ad clip itself and cut each matched occurrence.",
+    )
     parser.add_argument("--cue-threshold", type=float, default=0.62, help="Cue correlation threshold [0-1].")
     parser.add_argument("--cue-min-peak-gap", type=float, default=12.0, help="Min seconds between cue matches.")
     parser.add_argument("--cue-max-pair-gap", type=float, default=420.0, help="Max seconds between cue pair.")
@@ -451,7 +498,6 @@ def main() -> int:
         return 2
 
     total = ffprobe_duration(audio_path)
-    wm = load_whisper_model(args.model, args.compute_type, args.device)
 
     cue_matches: list[float] = []
     mode = "ml"
@@ -462,7 +508,7 @@ def main() -> int:
             return 2
 
         mode = "cue+ml"
-        candidates, cue_matches = cue_candidate_windows(
+        candidates, cue_matches, cue_sec = cue_candidate_windows(
             audio_path,
             cue_path,
             sample_rate=args.cue_sample_rate,
@@ -472,17 +518,27 @@ def main() -> int:
             cue_min_peak_gap=args.cue_min_peak_gap,
             cue_max_pair_gap=args.cue_max_pair_gap,
         )
-        segments = transcribe_windows(audio_path, candidates, wm)
-        scored = score_segments(segments, total)
-        cuts = []
-        for ws, we in candidates:
-            overlapping = [s for s in scored if windows_overlap(s.start, s.end, ws, we)]
-            best_score = max((s.score for s in overlapping), default=0.0)
-            pattern_hits = sum(s.pattern_hits for s in overlapping)
-            if best_score >= args.verify_threshold or pattern_hits > 0:
-                cuts.append((ws, we))
-        cuts = [(s, e) for s, e in cuts if (e - s) >= float(args.min_cut_seconds)]
+        if args.cue_is_ad_clip:
+            candidates = merge_windows(
+                [(s, min(total, s + cue_sec)) for s in cue_matches],
+                gap=1.0,
+            )
+            cuts = [(s, e) for s, e in candidates if (e - s) >= float(args.min_cut_seconds)]
+            scored: list[ScoredSeg] = []
+        else:
+            wm = load_whisper_model(args.model, args.compute_type, args.device)
+            segments = transcribe_windows(audio_path, candidates, wm)
+            scored = score_segments(segments, total)
+            cuts = []
+            for ws, we in candidates:
+                overlapping = [s for s in scored if windows_overlap(s.start, s.end, ws, we)]
+                best_score = max((s.score for s in overlapping), default=0.0)
+                pattern_hits = sum(s.pattern_hits for s in overlapping)
+                if best_score >= args.verify_threshold or pattern_hits > 0:
+                    cuts.append((ws, we))
+            cuts = [(s, e) for s, e in cuts if (e - s) >= float(args.min_cut_seconds)]
     else:
+        wm = load_whisper_model(args.model, args.compute_type, args.device)
         segments = transcribe(audio_path, wm)
         scored = score_segments(segments, total)
         raw_cuts: list[tuple[float, float]] = []
